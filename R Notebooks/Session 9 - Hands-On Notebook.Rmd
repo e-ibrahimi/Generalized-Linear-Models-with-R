@@ -1,0 +1,486 @@
+---
+title: "Introduction to Mixed-Effects GLMs"
+subtitle: "Session 9 — Hands-On Notebook"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This notebook fits mixed-effects GLMs on **real, published datasets** and
+walks through a full workflow for each: **model selection**, **model fit**,
+**model diagnostics**, and **interpretation**.
+
+| Part | Model | Dataset | Field | Outcome |
+|---|---|---|---|---|
+| 1 | Binomial GLMM | `cbpp` (built into `lme4`) | Veterinary epidemiology | Disease incidence in cattle herds |
+| 2 | Poisson / Negative-Binomial GLMM | `epilepsy` (built into `HSAUR3`) | Clinical / neurology | Seizure counts in an anti-epileptic drug trial |
+
+**Packages used today** (install once, then just `library()` each session):
+
+
+```{r packages}
+required_pkgs <- c("lme4", "car", "performance", "HSAUR3")
+missing_pkgs  <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  message("Missing required package(s): ", paste(missing_pkgs, collapse = ", "))
+}
+
+library(lme4)         # glmer(), glmer.nb()
+library(car)          # vif()
+library(performance)  # icc(), r2(), check_overdispersion(), check_singularity()
+library(HSAUR3)
+```
+
+# Part 1 — Binomial GLMM: Cattle Disease (`cbpp`)
+
+**Dataset:** contagious bovine pleuropneumonia (CBPP) incidence in 15
+African cattle herds, tracked over 4 time periods (56 herd-period rows,
+842 animals total). Herds are the natural clustering unit — animals within
+the same herd share management, environment, and exposure history, so
+observations are not independent.
+
+## 1.1 Load and inspect the data
+
+```{r load-cbpp}
+data(cbpp)
+str(cbpp)
+cat("Herds:", length(unique(cbpp$herd)), " | Rows:", nrow(cbpp),
+    " | Animals:", sum(cbpp$size), " | Cases:", sum(cbpp$incidence), "\n")
+```
+
+#Plots
+
+```{r}
+library(ggplot2)
+
+cbpp$prop <- cbpp$incidence / cbpp$size
+
+# 1. Incidence proportion by period
+ggplot(cbpp, aes(x = period, y = prop)) +
+  geom_boxplot(fill = "#6C4F94", alpha = 0.3, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.6, color = "#6C4F94") +
+  labs(title = "CBPP incidence proportion by period",
+       x = "Period", y = "Proportion infected (incidence / size)") +
+  theme_minimal()
+
+# 2. Spaghetti plot: each herd's trajectory across periods
+ggplot(cbpp, aes(x = period, y = prop, group = herd, color = herd)) +
+  geom_line(alpha = 0.7) +
+  geom_point(size = 1.5) +
+  labs(title = "Herd-level incidence trajectories across periods",
+       subtitle = "Each line is one herd -- motivates a random intercept for herd",
+       x = "Period", y = "Proportion infected") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 3. Herd-level average incidence, sorted (caterpillar plot)
+herd_summary <- aggregate(cbind(incidence, size) ~ herd, data = cbpp, sum)
+herd_summary$prop <- herd_summary$incidence / herd_summary$size
+herd_summary$herd <- factor(herd_summary$herd, levels = herd_summary$herd[order(herd_summary$prop)])
+
+ggplot(herd_summary, aes(x = herd, y = prop, size = size)) +
+  geom_point(color = "#6C4F94") +
+  coord_flip() +
+  labs(title = "Overall incidence rate by herd (sorted)",
+       subtitle = "Point size = total animals in herd",
+       x = "Herd", y = "Overall proportion infected") +
+  theme_minimal()
+```
+
+## 1.2 Model selection
+
+We build up from a naive model that ignores clustering, to a random-intercept
+model, and then check whether the data can even support a richer
+random-slope structure.
+
+```{r model-selection-cbpp}
+# m0: ignores herd entirely -- treats all 56 rows as independent
+m0 <- glm(cbind(incidence, size - incidence) ~ period, data = cbpp, family = binomial)
+
+# m1: random intercept for herd
+m1 <- glmer(cbind(incidence, size - incidence) ~ period + (1 | herd),
+            data = cbpp, family = binomial)
+
+# m2: would also let the period effect vary by herd -- try it and see
+m2_attempt <- tryCatch({
+  glmer(cbind(incidence, size - incidence) ~ period + (period | herd),
+        data = cbpp, family = binomial)
+}, error = function(e) e)
+
+if (inherits(m2_attempt, "error")) {
+  cat("m2 (random slope for period by herd) FAILED TO FIT:\n")
+  cat(conditionMessage(m2_attempt), "\n")
+} else {
+  print(summary(m2_attempt))
+}
+```
+
+> **Interpretation.** `m2` isn't just unwise, it's mathematically
+> infeasible: a herd-specific slope for a 4-level factor needs 4 parameters
+> per herd, but most herds contribute only 3-4 rows total. lme4 refuses to
+> fit it outright rather than silently returning garbage. This is a genuine
+> data-driven reason to prefer the simpler random-intercept structure — not
+> just a modeling convenience.
+
+**Compare the two feasible models:**
+
+```{r compare-m0-m1}
+anova(m1, m0)
+cat(sprintf("\nAIC m0 (no random effect) = %.1f\nAIC m1 (random intercept)  = %.1f\n",
+            AIC(m0), AIC(m1)))
+```
+
+> **Interpretation.** Adding the herd random intercept improves AIC
+> substantially and the likelihood ratio test is significant. Combined with
+> the design logic (animals are genuinely clustered within herds), we select
+> **m1** — random intercept for herd, fixed effect of period.
+
+## 1.3 Model fit
+
+```{r fit-cbpp}
+summary(m1)
+```
+
+## 1.4 Model diagnostics
+
+```{r diagnostics-cbpp}
+cat("Converged:", isTRUE(check_convergence(m1)), "\n")
+cat("Singular fit:", isSingular(m1), "\n\n")
+
+check_overdispersion(m1)
+```
+
+> **Interpretation.** The model converged cleanly and is not singular (the
+> herd variance is well away from zero). The overdispersion test finds no
+> evidence of extra binomial variance beyond what the model already
+> accounts for — the binomial-logit model with a herd random intercept is
+> adequate here. 
+
+**Simulation-based residuals (if `DHARMa` is installed):**
+
+```{r dharma-cbpp}
+if (requireNamespace("DHARMa", quietly = TRUE)) {
+  library(DHARMa)
+  sim_res <- simulateResiduals(m1)
+  plot(sim_res)
+} else {
+  message("Package 'DHARMa' not installed — run install.packages(\"DHARMa\") ",
+          "then simulateResiduals(m1) %>% plot() for simulation-based residual checks. ",
+          "The performance::check_overdispersion() result above already covers the ",
+          "most important check for this binomial model.")
+}
+```
+
+## 1.5 Interpretation
+
+```{r interpret-cbpp}
+round(exp(fixef(m1)), 3)      # odds ratios
+round(exp(confint(m1, parm = "beta_", method = "Wald")), 3)  # 95% CI
+
+icc(m1)
+r2(m1)
+```
+
+> **Interpretation.** Relative to period 1, the odds of CBPP incidence fall
+> to about 37% in period 2, 32% in period 3, and 21% in period 4 — a steady
+> decline consistent with disease-control measures taking effect over time.
+> The **ICC ≈ 0.42** means roughly 42% of the total latent variation in
+> disease susceptibility is attributable to differences *between herds*
+> rather than period or chance. The marginal R² (fixed effects alone) is 
+> lower than the conditional R² (fixed + random effects combined),
+> showing that herd identity adds real explanatory power beyond period.
+
+# Part 2 — Poisson / Negative-Binomial GLMM: Epileptic Seizure Counts
+
+**Dataset:** `epilepsy` — a real randomized clinical trial of the
+anti-epileptic drug progabide (Thall & Vail, 1990), bundled with the
+`HSAUR3` package. 59 patients, each with an 8-week baseline seizure count
+before randomization, then 4 follow-up visits (2 weeks apart) recording
+seizure counts on **placebo** or **progabide** — 236 rows, already in
+clean one-row-per-visit format. This is one of the standard textbook
+datasets for overdispersed longitudinal count data (it appears throughout
+the mixed-model literature, including in the `HSAUR3` book itself).
+
+Patients are the natural clustering unit — 4 repeated seizure counts from
+the same patient are far more similar to each other than to another
+patient's counts, so `subject` is the random-effect grouping factor.
+
+## 2.1 Load and inspect the data
+
+```{r load-epilepsy}
+data(epilepsy, package = "HSAUR3")
+str(epilepsy)
+
+epilepsy$base_c <- as.numeric(scale(epilepsy$base))
+epilepsy$age_c  <- as.numeric(scale(epilepsy$age))
+
+cat(sprintf("\nPatients: %d | Rows: %d\n",
+            length(unique(epilepsy$subject)), nrow(epilepsy)))
+table(epilepsy$treatment, epilepsy$period)
+summary(epilepsy$seizure.rate)
+cat("\nCrude variance/mean ratio:", var(epilepsy$seizure.rate) / mean(epilepsy$seizure.rate), "\n")
+```
+
+```{r}
+# 1. Histogram of seizure counts -- shows skew/overdispersion
+ggplot(epilepsy, aes(x = seizure.rate)) +
+  geom_histogram(binwidth = 5, fill = "#B8801F", alpha = 0.7, color = "white") +
+  labs(title = "Distribution of seizure counts",
+       subtitle = sprintf("Mean = %.1f, Variance = %.1f (variance >> mean: overdispersion)",
+                           mean(epilepsy$seizure.rate), var(epilepsy$seizure.rate)),
+       x = "Seizure count per visit", y = "Number of visits") +
+  theme_minimal()
+
+# 2. Seizure count by treatment (log scale, given the strong right skew)
+ggplot(epilepsy, aes(x = treatment, y = seizure.rate + 1, fill = treatment)) +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.4) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("placebo" = "#6C4F94", "Progabide" = "#B8801F")) +
+  labs(title = "Seizure count by treatment arm",
+       subtitle = "y-axis on log10 scale (+1) given the strong right skew",
+       x = "Treatment", y = "Seizure count + 1 (log scale)") +
+  theme_minimal() + theme(legend.position = "none")
+
+# 3. Spaghetti plot: each patient's trajectory across periods, patient 49 highlighted
+epilepsy$is_outlier <- ifelse(epilepsy$subject == 49, "Patient 49", "Other patients")
+ggplot(epilepsy, aes(x = period, y = seizure.rate, group = subject,
+                      color = is_outlier, alpha = is_outlier, linewidth = is_outlier)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c("Patient 49" = "#D6604D", "Other patients" = "#6C4F94")) +
+  scale_alpha_manual(values = c("Patient 49" = 1, "Other patients" = 0.35)) +
+  scale_linewidth_manual(values = c("Patient 49" = 1.2, "Other patients" = 0.5)) +
+  facet_wrap(~treatment) +
+  labs(title = "Seizure counts across visits, by patient",
+       subtitle = "One line per patient -- patient 49 highlighted as the known outlier",
+       x = "Visit (period)", y = "Seizure count", color = NULL, alpha = NULL, linewidth = NULL) +
+  theme_minimal()
+
+# 4. Baseline count vs. average follow-up seizure count
+patient_summary <- aggregate(seizure.rate ~ subject + base + treatment, data = epilepsy, mean)
+ggplot(patient_summary, aes(x = base, y = seizure.rate, color = treatment)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = c("placebo" = "#6C4F94", "Progabide" = "#B8801F")) +
+  labs(title = "Baseline seizure count vs. average follow-up count",
+       subtitle = "Each point is one patient (n = 59) -- patient 49 sits far to the right",
+       x = "Baseline seizure count (8-week pre-trial)", y = "Mean follow-up seizure count") +
+  theme_minimal()
+
+# 5. Mean-variance relationship per patient (visual overdispersion check)
+mv <- aggregate(seizure.rate ~ subject, data = epilepsy,
+                 FUN = function(x) c(mean = mean(x), var = var(x)))
+mv <- do.call(data.frame, mv)
+names(mv) <- c("subject", "mean", "var")
+ggplot(mv, aes(x = mean, y = var)) +
+  geom_point(alpha = 0.6, color = "#B8801F") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title = "Per-patient mean vs. variance of seizure counts",
+       subtitle = "Dashed line = Poisson assumption (variance = mean); most points sit above it",
+       x = "Patient mean seizure count", y = "Patient variance in seizure count") +
+  theme_minimal()
+```
+
+
+
+> **A note on patient 49.** This dataset has a famous outlier: one
+> patient's baseline count is 151 (8-week pre-trial seizures), against a
+> median of 22 across all 59 patients — and their follow-up counts (102,
+> 65, 72, 63) dwarf everyone else's. We'll fit the full model first, then
+> come back to this patient as a robustness check in section 2.6.
+
+## 2.2 Model selection
+
+```{r model-selection-epilepsy}
+# p0: ignores the repeated-measures structure entirely
+p0 <- glm(seizure.rate ~ treatment + base_c + age_c, data = epilepsy, family = poisson)
+cat("p0 crude dispersion:", sum(residuals(p0, type = "pearson")^2) / df.residual(p0), "\n")
+
+# p1: random intercept for subject (repeated visits per patient)
+p1 <- glmer(seizure.rate ~ treatment + base_c + age_c + (1 | subject),
+            data = epilepsy, family = poisson)
+
+cat(sprintf("\nAIC p0 (no random effect)   = %.1f\nAIC p1 (random intercept)   = %.1f\n",
+            AIC(p0), AIC(p1)))
+check_overdispersion(p1)
+```
+
+> **Interpretation.** The random intercept for `subject` cuts the crude
+> dispersion from about 5.1 down to 1.6 — most of the "overdispersion" in
+> a naive Poisson GLM here was really just unmodeled patient-to-patient
+> variation. But `check_overdispersion()` still flags real overdispersion
+> (ratio ≈ 1.3, p < 0.001) even after accounting for that. We try negative
+> binomial next.
+
+```{r remedy-epilepsy}
+p2 <- glmer.nb(seizure.rate ~ treatment + base_c + age_c + (1 | subject),
+               data = epilepsy,
+               control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+
+cat(sprintf("AIC p1 (Poisson) = %.1f\nAIC p2 (Negative Binomial) = %.1f\n", AIC(p1), AIC(p2)))
+cat("p2 singular:", isSingular(p2), " converged:", isTRUE(check_convergence(p2)), "\n")
+check_overdispersion(p2)
+```
+
+> **Interpretation.** Negative binomial resolves the overdispersion
+> (ratio ≈ 1.08, no longer significant) and improves AIC substantially
+> (1355.6 → 1269.7), with a clean, non-singular fit — no simplification
+> needed this time.
+
+**Is a richer random-effects structure supportable?** Each patient has 4
+repeated visits (`period`), so we could ask whether the visit-to-visit
+trend itself varies by patient:
+
+```{r random-slope-epilepsy}
+p_slope <- withCallingHandlers({
+  glmer.nb(seizure.rate ~ treatment + base_c + age_c + (period | subject),
+           data = epilepsy,
+           control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+}, warning = function(w) { cat("WARNING:", conditionMessage(w), "\n"); invokeRestart("muffleWarning") })
+
+cat(sprintf("\nAIC p2 (random intercept only)      = %.1f\n", AIC(p2)))
+cat(sprintf("AIC p_slope (+ random slope, period) = %.1f\n", AIC(p_slope)))
+cat("p_slope singular:", isSingular(p_slope), "\n")
+```
+
+> **Interpretation.** Unlike Part 1's `m2` (which flatly refused to fit),
+> `p_slope` *does* fit here — but only with an "iteration limit reached"
+> warning, and it doesn't even improve AIC over the simpler model (1273.5
+> vs. 1269.7). Two independent reasons to reject it: it's statistically no
+> better, and it's numerically less trustworthy. We select **p2** —
+> negative binomial, random intercept for subject only.
+
+## 2.3 Model fit
+
+```{r fit-epilepsy}
+summary(p2)
+```
+
+## 2.4 Model diagnostics
+
+```{r diagnostics-epilepsy}
+cat("Converged:", isTRUE(check_convergence(p2)), "\n")
+cat("Singular fit:", isSingular(p2), "\n\n")
+
+check_overdispersion(p2)
+vif(p2)
+```
+
+> **Interpretation.** `p2` converges cleanly, is not singular, shows no
+> remaining overdispersion, and all three fixed predictors have VIFs
+> close to 1 — no collinearity concern between treatment arm, baseline
+> count, and age.
+
+**Simulation-based residuals (if `DHARMa` is installed):**
+
+```{r dharma-epilepsy}
+if (requireNamespace("DHARMa", quietly = TRUE)) {
+  library(DHARMa)
+  sim_res_epi <- simulateResiduals(p2)
+  plot(sim_res_epi)
+  testOutliers(sim_res_epi)
+} else {
+  message("Package 'DHARMa' not installed — install.packages(\"DHARMa\") to get ",
+          "simulation-based QQ, residual-vs-predicted, and outlier tests for p2.")
+}
+```
+
+## 2.5 Interpretation
+
+```{r interpret-epilepsy}
+round(exp(fixef(p2)), 3)     # rate ratios
+round(exp(confint(p2, parm = "beta_", method = "Wald")), 3)
+
+icc(p2)
+r2(p2)
+```
+
+> **Interpretation.** Progabide is associated with a **23% lower** seizure
+> rate than placebo (rate ratio ≈ 0.77), but the interval is wide and
+> touches 1 (95% CI 0.57–1.04, p = 0.092) — a genuinely borderline result,
+> not the clean "the drug works" story a textbook example might lead you
+> to expect. Baseline seizure count is (unsurprisingly) a strong predictor
+> — each 1-SD increase in baseline count more than doubles the expected
+> follow-up rate (RR ≈ 2.07). Age shows no effect. The adjusted **ICC ≈ 0.51** 
+> shows that nearly half of the total variance in seizure counts is explained 
+> by stable, patient-level differences — which makes sense, 
+> since epilepsy severity is highly individual.
+
+## 2.6 Robustness check: the patient-49 outlier
+
+```{r sensitivity-epilepsy}
+epi_sub <- subset(epilepsy, subject != 49)
+epi_sub$base_c <- as.numeric(scale(epi_sub$base))
+epi_sub$age_c  <- as.numeric(scale(epi_sub$age))
+
+p3 <- glmer.nb(seizure.rate ~ treatment + base_c + age_c + (1 | subject), data = epi_sub,
+               control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+
+cat("With patient 49:    RR =", round(exp(fixef(p2))["treatmentProgabide"], 3),
+    " 95% CI", round(exp(confint(p2, parm="beta_", method="Wald"))["treatmentProgabide",], 3), "\n")
+cat("Without patient 49: RR =", round(exp(fixef(p3))["treatmentProgabide"], 3),
+    " 95% CI", round(exp(confint(p3, parm="beta_", method="Wald"))["treatmentProgabide",], 3), "\n")
+check_overdispersion(p3)
+```
+
+> **Interpretation.** Dropping the most extreme patient barely moves the
+> treatment effect (RR 0.77 → 0.79, still not reaching p < 0.05) — a
+> reassuring robustness result. This is itself worth knowing: a *naive*
+> Poisson GLM (no random effect, no NB) would be far more sensitive to
+> this single patient, since nothing in that model absorbs
+> patient-specific extremes. The combination of a patient-level random
+> intercept and the negative-binomial dispersion parameter already does
+> much of the work that manually excluding an outlier would otherwise be
+> needed for — a good general argument for reaching for a GLMM over a
+> plain GLM when your data are longitudinal, even before overdispersion
+> tests force the issue.
+
+
+# Recap: The Model-Selection Workflow
+
+```{r recap}
+cat(
+  "Binomial GLMM (cbpp):        m0 (glm) -> m1 (glmer, random intercept) -- selected\n",
+  "                             m2 (random slope) not fittable: too few obs/herd\n",
+  "Poisson/NB GLMM (epilepsy):\n",
+  "                             p0 (glm) -> p1 (glmer, random intercept) -- still overdispersed\n",
+  "                             p2 (+ negative binomial) -- resolves it, clean fit -- selected\n",
+  "                             random slope for period -- fits but no better, rejected\n",
+  "                             robustness check (drop outlier patient) -- conclusion unchanged\n",
+  sep = "")
+```
+
+> **General workflow, in four steps:**
+>
+> 1. **Model selection** — start simple (ignore clustering), add the random
+>    effects your design implies, and check whether richer structures are
+>    even identifiable given your data.
+> 2. **Model fit** — fit the selected model and read off fixed effects and
+>    variance components.
+> 3. **Model diagnostics** — check convergence, singular fits,
+>    overdispersion (for count/binomial families), collinearity (VIF), and
+>    simulation-based residuals (DHARMa) before trusting anything.
+> 4. **Interpretation** — report fixed effects as odds/rate ratios *and*
+>    report the random-effect variance or ICC — the clustering structure is
+>    part of the finding, not a nuisance to be modeled away and forgotten.
+
+---
+
+*End of Session 9 hands-on notebook.*
+
+**Data sources**
+
+- `cbpp`: built into the `lme4` package; see `?cbpp` for the original veterinary source.
+- `epilepsy`: Thall, P.F. & Vail, S.C. (1990). Some covariance models for longitudinal count data with overdispersion. *Biometrics*, 46(3), 657–671. Data bundled with the `HSAUR3` package (Everitt & Hothorn).

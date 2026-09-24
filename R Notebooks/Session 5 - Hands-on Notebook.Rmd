@@ -1,0 +1,433 @@
+---
+title: "Session 5 Hands-on: Poisson Regression for Count Data"
+subtitle: "Modeling Esophageal Cancer Risk"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                       fig.align = "center", fig.width = 5.5, fig.height = 4)
+library(ggplot2)
+library(dplyr)
+library(broom)
+library(MASS)
+```
+
+# Learning Objectives
+
+By the end of this lab, you will be able to:
+
+1.  Fit a Poisson regression model with an offset to real, grouped count data
+2.  Use likelihood-ratio tests and AIC to select among nested Poisson models
+3.  Convert coefficients into rate ratios and interpret them
+4.  Run diagnostic checks for overdispersion, and decide whether a quasi-Poisson or negative binomial alternative is warranted
+5.  Generate and interpret predictions from a fitted model
+
+> **How to use this lab:** Run each chunk in order. Short **Reflection** prompts appear throughout — these are quick discussion questions for you (and the room) to talk through together; jot a one-line answer before checking the collapsible **Show solution**.
+
+------------------------------------------------------------------------
+
+# About the Data
+
+Today we're moving from the lecture's illustrative example to **real data**: a classic case-control study of esophageal cancer in Ille-et-Vilaine, France (Breslow & Day, 1980), built into base R as `esoph`.
+
+```{r load-data}
+data(esoph)
+esoph$total <- esoph$ncases + esoph$ncontrols
+str(esoph)
+```
+
+Each row is a **stratum** defined by three ordered factors, not an individual patient:
+
+- `agegp` — age group (6 levels, `"25-34"` to `"75+"`)
+- `alcgp` — daily alcohol consumption group (4 levels)
+- `tobgp` — daily tobacco consumption group (4 levels)
+- `ncases` — number of esophageal cancer cases in that stratum
+- `ncontrols` — number of controls sampled in that stratum
+- `total` — `ncases + ncontrols`, the stratum size (added above)
+
+We'll model `ncases` as a Poisson count, using `offset = log(total)` so that we're modeling the **rate of cases within each stratum**, exactly like the offset logic from lecture.
+
+> **Important caveat:** Because this is a **case-control study**, controls were sampled deliberately and don't represent the true population at risk. That means the *absolute* predicted rate from our model should **not** be read as a real-world cancer probability — but *relative* comparisons (rate ratios) across strata are still valid and are the classic strength of this design. Keep this in mind when we get to predictions.
+
+------------------------------------------------------------------------
+
+# Explore the Data
+
+```{r explore}
+summary(esoph[, c("ncases", "ncontrols", "total")])
+```
+
+```{r explore-plot}
+esoph %>%
+  group_by(agegp) %>%
+  summarise(cases = sum(ncases), total = sum(total), rate = cases / total) %>%
+  ggplot(aes(x = agegp, y = rate, group = 1)) +
+  geom_point(size = 2.5, color = "#1C7293") +
+  geom_line(color = "#1C7293") +
+  labs(title = "Crude Case Rate by Age Group",
+       x = "Age Group", y = "Proportion of Cases") +
+  theme_minimal(base_size = 13)
+```
+
+> **Reflection:** Just from this plot, does age look related to case rate? Would you expect a straight line (linear) or a curved (quadratic) relationship on the log scale?
+>
+> *Discuss:*
+>
+>  
+
+------------------------------------------------------------------------
+
+# Fit an Initial Model
+
+Let's start simple: model case counts using only `agegp`.
+
+```{r naive-model}
+m_age <- glm(ncases ~ agegp, offset = log(total), family = poisson(link = "log"), data = esoph)
+summary(m_age)
+```
+
+```{r naive-dispersion}
+cat("Residual deviance / df:", round(deviance(m_age) / df.residual(m_age), 2), "\n")
+cat("Pearson dispersion statistic:", round(sum(residuals(m_age, type = "pearson")^2) / df.residual(m_age), 2), "\n")
+```
+
+> **Reflection:** That dispersion statistic is well above 1. Before concluding the data are truly overdispersed, what's another explanation we should rule out first?
+>
+> *Discuss:*
+>
+>  
+
+Apparent overdispersion is often a symptom of an **underspecified mean model** — important predictors left out — rather than genuine extra-Poisson variance. Age alone is unlikely to capture everything driving esophageal cancer risk; let's see what happens once we add tobacco and alcohol use.
+
+------------------------------------------------------------------------
+
+# Model Selection
+
+```{r full-model}
+m_full <- glm(ncases ~ agegp + tobgp + alcgp,
+              offset = log(total), family = poisson(link = "log"), data = esoph)
+summary(m_full)
+```
+
+## Likelihood-Ratio Test: Does Adding Predictors Help?
+
+```{r anova-lrt}
+anova(m_age, m_full, test = "Chisq")
+```
+
+## Stepwise Selection by AIC
+
+```{r stepaic}
+m_step <- stepAIC(m_full, direction = "both", trace = FALSE)
+formula(m_step)
+AIC(m_age, m_full, m_step)
+```
+
+> **Reflection:** Based on the likelihood-ratio test and the AIC comparison, which model would you choose — and why doesn't `stepAIC` remove any terms from the full model?
+>
+> *Discuss:*
+>
+>  
+
+The LRT comparing `m_age` to `m_full` is highly significant (p \< 0.001), so adding `tobgp` and `alcgp` meaningfully improves fit. `stepAIC` keeps all three predictors because removing any one of them increases AIC (each is worth its degrees of freedom) — so the full model is also the AIC-best model here.
+
+------------------------------------------------------------------------
+
+# Interpret the Rate Ratios
+
+```{r rate-ratios}
+tidy(m_full, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+```
+
+Because `agegp`, `tobgp`, and `alcgp` are **ordered factors**, R splits each into polynomial contrasts (`.L` linear, `.Q` quadratic, `.C` cubic, ...). The linear (`.L`) term captures the overall trend across ordered levels — that's usually the one to focus on first.
+
+> **Reflection:** `alcgp.L` has a rate ratio well above 1, and `agegp.L` even more so. In plain language, what do these two linear terms tell a non-statistician about cancer risk?
+>
+> *Discuss:*
+>
+>  
+
+Both show a strong **increasing linear trend**: case rates rise steadily as alcohol consumption group increases, and rise steadily (up to a point — note the significant negative quadratic term `agegp.Q`) as age group increases. In plain language: heavier drinkers and older men show consistently higher esophageal cancer rates in this sample, holding the other factor constant.
+
+------------------------------------------------------------------------
+
+# Diagnostic Checks
+
+## Has Overdispersion Improved?
+
+```{r full-dispersion}
+cat("Residual deviance / df:", round(deviance(m_full) / df.residual(m_full), 2), "\n")
+cat("Pearson dispersion statistic:", round(sum(residuals(m_full, type = "pearson")^2) / df.residual(m_full), 2), "\n")
+```
+
+## Residual Plot
+
+```{r residual-plot}
+diag_df <- data.frame(fitted = fitted(m_full), resid = residuals(m_full, type = "deviance"))
+ggplot(diag_df, aes(x = fitted, y = resid)) +
+  geom_point(color = "#1C7293", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#F2A541") +
+  labs(title = "Deviance Residuals vs. Fitted Values",
+       x = "Fitted Values", y = "Deviance Residual") +
+  theme_minimal(base_size = 13)
+```
+
+------------------------------------------------------------------------
+
+# Predictions
+
+Let's use `m_full` to compare predicted case rates for a lower-risk and a higher-risk profile, per 100 people in that stratum.
+
+```{r predictions}
+new_profiles <- data.frame(
+  agegp = factor(c("35-44", "65-74"), levels = levels(esoph$agegp), ordered = TRUE),
+  tobgp = factor(c("0-9g/day", "20-29"), levels = levels(esoph$tobgp), ordered = TRUE),
+  alcgp = factor(c("0-39g/day", "120+"), levels = levels(esoph$alcgp), ordered = TRUE),
+  total = c(100, 100)
+)
+new_profiles$predicted_cases_per_100 <- predict(m_full, newdata = new_profiles, type = "response")
+new_profiles
+```
+
+> **Reflection:** Given the case-control caveat from earlier, how should we talk about these two predicted numbers — as real-world cancer probabilities, or something else?
+>
+> *Discuss:*
+>
+>  
+
+Because controls were sampled rather than drawn to reflect true population prevalence, we should **not** say "a 65-74 year old heavy drinker/smoker has an X% chance of cancer." What we *can* say is that this profile's predicted rate is many times higher than the younger, lower-consumption profile — a valid **relative** comparison, which is exactly what a case-control design is built to support.
+
+## Try It Yourself
+
+Predict the expected cases per 100 for a **55-64** year old in the **highest** tobacco group (`"30+"`) and **lowest** alcohol group (`"0-39g/day"`).
+
+```{r your-turn, eval=FALSE}
+profile3 <- data.frame(
+  agegp = factor("___", levels = levels(esoph$agegp), ordered = TRUE),
+  tobgp = factor("___", levels = levels(esoph$tobgp), ordered = TRUE),
+  alcgp = factor("___", levels = levels(esoph$alcgp), ordered = TRUE),
+  total = ___
+)
+predict(___, newdata = ___, type = "___")
+```
+
+<details>
+
+<summary>Show solution</summary>
+
+```{r your-turn-solution}
+profile3 <- data.frame(
+  agegp = factor("55-64", levels = levels(esoph$agegp), ordered = TRUE),
+  tobgp = factor("30+", levels = levels(esoph$tobgp), ordered = TRUE),
+  alcgp = factor("0-39g/day", levels = levels(esoph$alcgp), ordered = TRUE),
+  total = 100
+)
+predict(m_full, newdata = profile3, type = "response")
+```
+
+</details>
+
+## The `epil` Dataset
+
+The `epil` dataset (Thall & Vail, 1990) records **epileptic seizure counts** from a randomized placebo-controlled trial of the anti-epileptic drug **progabide**. Fifty-nine patients were followed over **four consecutive two-week periods**.
+
+```{r epil-load}
+data(epil, package = "MASS")
+str(epil)
+```
+
+```{r epil-dict}
+epi_dict <- data.frame(
+  Variable = c("y","trt","base","age","V4","subject","period","lbase","lage"),
+  Description = c(
+    "Seizure count in a 2-week period — the count outcome",
+    "Treatment group: 'placebo' or 'progabide'",
+    "Baseline seizure count (8 weeks before trial)",
+    "Patient age (years)",
+    "Indicator: 4th observation period (captures period-specific shift)",
+    "Patient ID (59 patients × 4 periods = 236 observations)",
+    "Observation period: 1 to 4",
+    "log(base / 4) — log-scaled baseline rate per 2-week period",
+    "log(age) — log-transformed patient age"
+  )
+)
+
+```
+
+## Exploratory Data Analysis
+
+```{r epil-summary}
+cat("Seizure count summary:\n")
+summary(epil$y)
+cat(sprintf("\n  Mean:     %.2f\n  Variance: %.2f\n  Ratio (Var/Mean): %.2f\n",
+            mean(epil$y), var(epil$y), var(epil$y) / mean(epil$y)))
+cat("\nNote: Variance >> Mean suggests overdispersion — a key diagnostic concern.\n")
+```
+
+```{r epil-dist-plot}
+ggplot(epil, aes(x = y, fill = trt)) +
+  geom_histogram(binwidth = 2, color = "white", alpha = 0.75) +
+  scale_fill_manual(values = c("placebo" = "#2c7fb8", "progabide" = "#d7301f")) +
+  facet_wrap(~ trt, ncol = 2,
+             labeller = labeller(trt = c(placebo = "Placebo", progabide = "Progabide"))) +
+  labs(
+    title    = "Distribution of Seizure Counts by Treatment Group",
+    
+    x = "Seizure count (per 2-week period)", y = "Frequency"
+  ) +
+  theme(legend.position = "none")
+```
+
+## Model Building
+
+### Model 1 — Null
+
+```{r epil-null}
+ep0 <- glm(y ~ 1, data = epil, family = poisson)
+cat("Null deviance:", round(deviance(ep0), 2), "on", df.residual(ep0), "df\n")
+cat("Global mean count:", round(mean(epil$y), 3), "\n")
+```
+
+### Model 2 — Treatment Only (Unadjusted)
+
+```{r epil-trt}
+ep1 <- glm(y ~ trt, data = epil, family = poisson)
+summary(ep1)
+
+cat(sprintf("\nUnadjusted IRR for progabide: %.3f  (95%% CI: %.3f – %.3f)\n",
+            exp(coef(ep1)["trtprogabide"]),
+            exp(confint.default(ep1)["trtprogabide", 1]),
+            exp(confint.default(ep1)["trtprogabide", 2])))
+```
+
+### Model 3 — Adjusted (Treatment + Baseline + Age + Period)
+
+```{r epil-adjusted}
+ep2 <- glm(y ~ trt + lbase + lage + V4,
+           data   = epil,
+           family = poisson)
+summary(ep2)
+```
+
+## Calculate the Rate Ratios (IRR)
+
+```{r}
+IRR_table <- exp(cbind(
+  IRR      = coef(ep2),
+  Lower95  = confint(ep2)[, 1],
+  Upper95  = confint(ep2)[, 2]
+))
+
+cat("\nIRR with 95% CI:\n")
+print(round(IRR_table, 3))
+```
+
+## Interpretation
+
+Reporting Incidence Rate Ratios (IRR). IRR = 1 means no effect; IRR \> 1 means higher rate; IRR \< 1 means lower rate.
+
+Term-by-Term Interpretation Intercept (IRR = 5.740) - The baseline expected seizure count (when all predictors = 0) is 5.74 per period. Highly significant (p \< 0.001), but not meaningful on its own.
+
+trtprogabide (IRR = 0.983, p = 0.715) - Patients on Progabide have a seizure rate 1.7% lower than the control group. The 95% CI (0.894 – 1.080) crosses 1, meaning the effect could go either direction. Not statistically significant (p = 0.715) — no strong evidence that Progabide reduces seizures compared to placebo.
+
+lbase — log(baseline seizure count) (IRR = 3.405, p \< 0.001) - The strongest predictor in the model. A one-unit increase in log-baseline seizures is associated with 3.4× higher seizure rate during the trial. Narrow CI (3.195 – 3.629) and p \< 0.001 → highly significant. Makes clinical sense: patients with more seizures at baseline tend to have more during treatment.
+
+lage — log(age) (IRR = 1.800, p \< 0.001) - A one-unit increase in log-age is associated with 1.8× higher seizure rate. CI (1.451 – 2.233) does not cross 1 → statistically significant. Older patients tend to have higher seizure rates, after adjusting for other factors.
+
+V4 — Visit 4 indicator (IRR = 0.851, p = 0.003) - At Visit 4, the seizure rate is 14.9% lower compared to the reference visit. CI (0.765 – 0.947) does not cross 1 → statistically significant. Suggests a time effect — seizure rates decline by the 4th visit, possibly due to treatment adaptation or natural variability.
+
+## Plot the results
+
+```{r epil-irr-forest}
+cf_ep2 <- data.frame(
+  Term     = names(coef(ep2))[-1],
+  IRR      = exp(coef(ep2))[-1],
+  CI_lower = exp(confint.default(ep2))[-1, 1],
+  CI_upper = exp(confint.default(ep2))[-1, 2],
+  p_value  = coef(summary(ep2))[-1, 4]
+)
+
+ggplot(cf_ep2, aes(x = IRR, y = reorder(Term, IRR))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper),
+                 height = 0.25, color = "#2c7fb8", linewidth = 0.9) +
+  geom_point(aes(color = p_value < 0.05), size = 3.5) +
+  scale_color_manual(
+    values = c("TRUE" = "#d7301f", "FALSE" = "#2c7fb8"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"), name = NULL
+  ) +
+  scale_x_log10() +
+  labs(
+    title    = "Incidence Rate Ratios: Epileptic Seizures",
+    subtitle = "IRR < 1 = fewer seizures; IRR > 1 = more seizures",
+    x = "Incidence Rate Ratio (log scale)", y = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+```{r epil-meanvar}
+# Mean-variance plot by subject
+mean_var <- epil |>
+  group_by(subject) |>
+  summarise(subj_mean = mean(y), subj_var = var(y), .groups = "drop")
+
+ggplot(mean_var, aes(x = subj_mean, y = subj_var)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "#2c7fb8", linewidth = 0.9) +
+  geom_point(color = "#2c7fb8", alpha = 0.65, size = 2.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "#d7301f", linewidth = 1) +
+  annotate("text", x = 8,  y = 2,
+           label = "Poisson: Var = Mean", color = "#2c7fb8", size = 2.5) +
+  annotate("text", x = 23, y = 100,
+           label = "Observed trend", color = "#d7301f", size = 2.5) +
+  labs(
+    title    = "Mean-Variance Relationship by Subject",
+    subtitle = "Observed variance greatly exceeds the mean — overdispersion confirmed",
+    x = "Subject mean seizure count", y = "Subject variance"
+  )
+```
+
+```{r}
+#Dispersion for ep2 model
+cat("Residual deviance / df:", round(deviance(ep2) / df.residual(ep2), 2), "\n")
+cat("Pearson dispersion statistic:", round(sum(residuals(ep2, type = "pearson")^2) / df.residual(ep2), 2), "\n")
+```
+
+### QQ Plot of Deviance Residuals
+
+```{r epil-qq}
+qqnorm(residuals(ep2, type = "deviance"),
+       main  = "QQ Plot of Deviance Residuals (Poisson Model)",
+       col   = "#2c7fb8", pch = 16, cex = 0.7)
+qqline(residuals(ep2, type = "deviance"),
+       col = "#d7301f", lwd = 1.5)
+mtext("Heavy tails confirm overdispersion — Poisson assumption is violated",
+      side = 3, cex = 0.8, col = "gray40")
+```
+
+# Wrap-Up: Reflection Questions
+
+Quick discussion, out loud or jotted down:
+
+1.  Why did the simple `agegp`-only model look overdispersed, when the full model didn't?
+2.  What's the difference between what a rate ratio tells you and what an absolute predicted count tells you — and why did that distinction matter for this dataset specifically?
+3.  If you were handed a new count dataset tomorrow, what's the order of steps you'd follow, based on today's lab?
+
+------------------------------------------------------------------------
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

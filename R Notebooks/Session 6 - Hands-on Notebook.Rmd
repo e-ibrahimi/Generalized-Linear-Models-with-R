@@ -1,0 +1,196 @@
+---
+title: "Session 6 Hands-on: Quasi-Poisson & Negative Binomial Models"
+subtitle: "When Overdispersion Can't Be Explained Away: A Microbiome Case Study"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                       fig.align = "center", fig.width = 6.5, fig.height = 4)
+# install.packages("GUniFrac")  # uncomment/run once if you don't have this package yet
+library(ggplot2)
+library(dplyr)
+library(broom)
+library(MASS)
+library(GUniFrac)
+```
+
+# Learning Objectives
+
+In the last lab we fit Poisson regression models to grouped count data. This lab question: **what do you do when the Poisson assumption breaks, and adding covariates doesn't fix it?**
+
+By the end of this lab, you will be able to:
+
+1.  Recognize overdispersion that is too large to be explained by missing covariates
+2.  Fit quasi-Poisson and negative binomial models as two different corrections
+3.  Explain, using a real result, how ignoring overdispersion manufactures false positives
+4.  Choose between quasi-Poisson and negative binomial for a given analysis goal
+
+------------------------------------------------------------------------
+
+# About the Data
+
+We're leaving epidemiology behind for a domain where overdispersion isn't a nuisance to be resolved — it's the norm: **microbiome sequencing data**.
+
+We'll use a real, published data set (via the `GUniFrac` package): 16S rRNA sequencing of the throat microbiome from 60 subjects — 32 non-smokers and 28 smokers — from a study of how cigarette smoking affects the upper respiratory tract microbiome.
+
+> Charlson ES, Chen J, Custers-Allen R, Bittinger K, Li H, et al. (2010) *Disordered Microbial Communities in the Upper Respiratory Tract of Cigarette Smokers.* PLoS ONE 5(12): e15216.
+
+```{r load-data}
+data(throat.otu.tab)   # samples x OTUs count matrix
+data(throat.meta)      # sample-level metadata
+
+lib_size <- rowSums(throat.otu.tab)
+cat("Samples:", nrow(throat.otu.tab), " | OTUs (taxa):", ncol(throat.otu.tab), "\n")
+cat("Smoking status counts:\n")
+print(table(throat.meta$SmokingStatus))
+cat("\nReads per sample (library size) ranges from", min(lib_size), "to", max(lib_size), "\n")
+```
+
+Each **row** is a subject; each **column** is an OTU (operational taxonomic unit — roughly, "a microbial species"). The value in each cell is a **count**: how many sequencing reads from that subject were assigned to that OTU.
+
+Just like `total` in the previous lab, sequencing depth (`lib_size`) varies almost 5-fold across subjects for reasons that have nothing to do with biology. So once again, we model counts with **`offset = log(lib_size)`** — same logic as before, new domain.
+
+We'll focus on one abundant, well-detected OTU to start (id `"4414"`), then generalize to a second one later.
+
+```{r select-otu}
+otu_id <- "4414"
+y <- throat.otu.tab[, otu_id]
+
+df <- data.frame(
+  count         = y,
+  lib_size      = lib_size,
+  SmokingStatus = throat.meta$SmokingStatus,
+  Sex           = throat.meta$Sex,
+  Age           = throat.meta$Age
+)
+summary(df$count)
+```
+
+------------------------------------------------------------------------
+
+# Warm-Up: Raw Counts by Group
+
+```{r warmup-plot}
+ggplot(df, aes(x = SmokingStatus, y = count, color = SmokingStatus)) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 2) +
+  geom_boxplot(fill = NA, color = "grey30", width = 0.35, outlier.shape = NA) +
+  scale_color_manual(values = c(NonSmoker = "#1C7293", Smoker = "#E8A33D")) +
+  labs(title = paste("OTU", otu_id, "Counts by Smoking Status"),
+       x = NULL, y = "Read count") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+Counts are noisy and right-skewed, with a few subjects carrying far more reads of this OTU than most. Keep that shape in mind — it's a visual preview of what "extra variance beyond Poisson" looks like.
+
+------------------------------------------------------------------------
+
+# Step 1: The Naive Poisson Model
+
+Exactly the model you'd fit after the last lab: one predictor, one offset.
+
+```{r naive-poisson}
+m_pois <- glm(count ~ SmokingStatus, offset = log(lib_size),
+              family = poisson(link = "log"), data = df)
+summary(m_pois)
+```
+
+That p-value for `SmokingStatusSmoker` is not a typo — smoking looks like an overwhelmingly strong predictor of this OTU's abundance. Before you report that, though, a GLM is only as trustworthy as its variance assumption. Let's check it.
+
+------------------------------------------------------------------------
+
+# Step 2: Diagnosing Overdispersion
+
+Compute the Pearson dispersion statistic for `m_pois`.
+
+```{r naive-dispersion-sol}
+disp_pois <- sum(residuals(m_pois, type = "pearson")^2) / df.residual(m_pois)
+round(disp_pois, 1)
+```
+
+A dispersion statistic near **80** is an entirely different scale of problem than the last lab's ≈1.2 — this isn't a mild correction, it's evidence the Poisson variance assumption has failed badly.
+
+</details>
+
+Two of the causes from lecture are almost certainly at work here, and neither is fixable by adding a covariate to this data set:
+
+- **Unobserved heterogeneity** — each person's microbiome is shaped by diet, genetics, immune status, and history in ways `SmokingStatus` alone can never capture
+- **Clustering** — microbial abundances co-vary within a person's ecosystem in ways a single count model doesn't represent
+
+We only have a couple of demographic variables on hand (`Sex`, `Age`) to add to the model — nowhere near enough to explain away this scale of variability.
+
+```{r bonus-sol}
+m_pois_more <- glm(count ~ SmokingStatus + Sex + Age, offset = log(lib_size),
+                    family = poisson(link = "log"), data = df)
+round(sum(residuals(m_pois_more, type = "pearson")^2) / df.residual(m_pois_more), 1)
+```
+
+Dispersion barely moves (≈80 either way). Unlike the previous lab, where two omitted covariates explained nearly all of the extra variance, here there simply isn't a covariate in this data set that would resolve it — the variability is intrinsic to how microbial communities differ from host to host. This is exactly the case quasi-Poisson and negative binomial models exist for.
+
+------------------------------------------------------------------------
+
+# Step 3: Fix #1 — Quasi-Poisson
+
+```{r quasi-poisson}
+m_quasi <- glm(count ~ SmokingStatus, offset = log(lib_size),
+               family = quasipoisson(link = "log"), data = df)
+summary(m_quasi)
+```
+
+Compare the two fits directly:
+
+```{r compare-pois-quasi}
+data.frame(
+  term       = names(coef(m_pois)),
+  estimate   = round(coef(m_pois), 3),
+  poisson_se = round(coef(summary(m_pois))[, "Std. Error"], 3),
+  quasi_se   = round(coef(summary(m_quasi))[, "Std. Error"], 3),
+  poisson_p  = signif(coef(summary(m_pois))[, "Pr(>|z|)"], 3),
+  quasi_p    = signif(coef(summary(m_quasi))[, "Pr(>|t|)"], 3)
+)
+```
+
+**This is the whole lecture in one table.** The coefficient hasn't moved at all — quasi-Poisson keeps the same mean model. But the standard error for `SmokingStatusSmoker` inflates by roughly $\sqrt{\hat\varphi} \approx \sqrt{80} \approx 9\times$, and the p-value goes from "astronomically significant" to comfortably non-significant. The naive Poisson model's confident finding was mostly an artifact of underestimated uncertainty.
+
+------------------------------------------------------------------------
+
+# Step 4: Fix #2 — Negative Binomial
+
+```{r negative-binomial}
+m_nb <- glm.nb(count ~ SmokingStatus + offset(log(lib_size)), data = df)
+summary(m_nb)
+```
+
+```{r nb-diagnostics}
+cat("Theta:", round(m_nb$theta, 2), " (SE:", round(m_nb$SE.theta, 2), ")\n")
+cat("AIC - Poisson:", round(AIC(m_pois), 1), " | Negative Binomial:", round(AIC(m_nb), 1), "\n")
+```
+
+Notice the difference from last time: theta here is small (≈1.4) with a tight standard error — a **stable, well-estimated** dispersion parameter, not the huge unstable estimate you saw when there was essentially no real overdispersion to find. That's exactly the signature of genuine overdispersion that the negative binomial is designed to capture. The AIC comparison is just as dramatic: negative binomial wins by thousands of points.
+
+Reassuringly, the negative binomial model reaches the **same conclusion** as quasi-Poisson: once dispersion is modeled honestly, `SmokingStatus` is no longer a significant predictor of this OTU's abundance.
+
+------------------------------------------------------------------------
+
+# Reflection & Discussion
+
+1.  If this had been a real study reported using only the naive Poisson model, what claim would have gone into the paper — and would it have held up?
+2.  Fields that work with count data like this (microbiome studies, RNA-seq gene expression counts) overwhelmingly default to negative-binomial-based models (this is exactly what tools like `edgeR` and `DESeq2` do under the hood). Now that you've seen *why*, does that default make sense to you?
+
+------------------------------------------------------------------------
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,385 @@
+---
+title: "Multinomial & Ordinal Logistic Regression"
+subtitle: "Session 7 — Hands-On Script"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    df_print: paged
+    code_download: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This notebook fits both models from session 7 slides on **real,
+published datasets from health and biology research** — no simulated
+data. Run each chunk in order; later chunks depend on objects created
+earlier.
+
+| Part | Model | Dataset | Field | Outcome |
+|---------------|---------------|---------------|---------------|---------------|
+| 1 | Multinomial logit | `Alligator` (Agresti, 2002) | Wildlife ecology | Primary food type (5 unordered categories) |
+| 2 | Ordinal logit | `Arthritis` (Koch & Edwards, 1988) | Clinical trial | Improvement in rheumatoid arthritis (3 ordered categories) |
+
+**Packages used today** (installed once, then just `library()` each
+session):
+
+```{r packages}
+required_pkgs <- c("nnet", "MASS", "car", "vcd", "vcdExtra", "AER", "broom")
+missing_pkgs  <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  message("Missing required package(s): ", paste(missing_pkgs, collapse = ", "))
+}
+
+library(nnet)     # multinomial logistic regression: multinom()
+library(MASS)     # ordinal logistic regression: polr()
+library(car)      # vif() for both model types
+library(vcdExtra) # Alligator data
+library(vcd)      # Arthritis data
+library(broom)      
+```
+
+# Part 1 — Multinomial Logistic Regression
+
+**Dataset: `Alligator`** — a study of the primary food choice of 219
+alligators captured in four Florida lakes; stomach contents were
+classified into five categories (Agresti, *Categorical Data Analysis*,
+2002, Table 7.1, via the `vcdExtra` package). Food type is genuinely
+**nominal** — there is no natural order between "fish," "invertebrate,"
+"reptile," "bird," and "other."
+
+## 1.1 Load and inspect the data
+
+The data ship as a *grouped* frequency table (one row per lake × sex ×
+size × food combination, with a `count` column). We expand it to one row
+per alligator, which makes prediction, classification tables, and
+diagnostics more direct.
+
+```{r load-alligator}
+data(Alligator, package = "vcdExtra")
+
+idx <- rep(seq_len(nrow(Alligator)), Alligator$count)
+gators <- Alligator[idx, c("lake", "sex", "size", "food")]
+rownames(gators) <- NULL
+gators$food <- relevel(gators$food, ref = "fish")   # fish = most common choice
+
+str(gators)
+table(gators$food)
+```
+
+## 1.2 Fit the multinomial logistic regression
+
+```{r fit-multinom}
+model_mn <- multinom(food ~ lake + size + sex, data = gators, trace = FALSE)
+summary(model_mn)
+```
+
+## 1.3 Statistical significance
+
+`multinom()` does not print p-values by default — compute using broom
+package.
+
+```{r}
+library(broom)
+
+# Tidy summary with estimate, std.error, statistic (z), and p.value all computed automatically
+tidy(model_mn)
+
+# Optional: add confidence intervals for the log-odds coefficients
+tidy(model_mn, conf.int = TRUE)
+
+# Optional: exponentiate to get RRRs (and their CIs) directly, instead of log-odds
+tidy(model_mn, exponentiate = TRUE, conf.int = TRUE)
+```
+
+## 1.4 Relative risk ratios (RRR) and confidence intervals
+
+```{r multinom-rrr}
+rrr    <- exp(coef(model_mn))
+rrr_ci <- exp(confint(model_mn))
+
+round(rrr, 3)
+round(rrr_ci, 3)
+```
+
+> **Interpretation.** Every row is compared to the baseline category,
+> `fish`. The clearest biological signal is **size**: small alligators
+> have much higher odds of eating invertebrates rather than fish than
+> large alligators do (RRR well above 1, p \< 0.01) — consistent with
+> juvenile alligators relying more on snails, insects, and crayfish
+> before shifting to a fish-dominated diet as adults. **Lake** also
+> matters: alligators in Lake Trafford show sharply elevated odds of
+> eating invertebrates, other prey, and reptiles relative to fish,
+> compared with the Lake George baseline. `sex` is not a strong
+> predictor of diet in this sample.
+
+## 1.5 Overall model fit
+
+```{r multinom-fit}
+model_mn_null <- multinom(food ~ 1, data = gators, trace = FALSE)
+
+lr_stat_mn  <- as.numeric(2 * (logLik(model_mn) - logLik(model_mn_null)))
+lr_df_mn    <- model_mn$edf - model_mn_null$edf
+lr_p_mn     <- pchisq(lr_stat_mn, df = lr_df_mn, lower.tail = FALSE)
+mcfadden_mn <- as.numeric(1 - logLik(model_mn) / logLik(model_mn_null))
+
+cat(sprintf("Likelihood ratio chi-sq(%d) = %.2f, p = %.3g\n", lr_df_mn, lr_stat_mn, lr_p_mn))
+cat(sprintf("McFadden's pseudo-R^2 = %.3f\n", mcfadden_mn))
+cat(sprintf("AIC = %.1f   BIC = %.1f\n", AIC(model_mn), BIC(model_mn)))
+```
+
+> **Interpretation.** The likelihood ratio test compares this model to
+> an intercept-only model; a small p-value means lake, size, and sex
+> jointly improve fit. McFadden's pseudo-R² of 0.11 is modest but real —
+> ecological field data are noisy, and 0.2–0.4 is the range usually
+> considered a strong fit, so don't expect values as high as OLS R².
+
+## 1.6 Classification accuracy
+
+```{r multinom-accuracy}
+pred_mn <- predict(model_mn, type = "class")
+tab_mn  <- table(Predicted = pred_mn, Actual = gators$food)
+tab_mn
+
+sprintf("Accuracy = %.3f   |   Baseline (always predict %s) = %.3f",
+        sum(diag(tab_mn)) / sum(tab_mn),
+        names(which.max(table(gators$food))),
+        max(prop.table(table(gators$food))))
+```
+
+> **Interpretation.** The model only ever predicts `fish` or `invert` —
+> the two most common categories — because `lake`, `size`, and `sex`
+> don't separate the rarer categories (`bird`, `other`, `reptile`)
+> sharply enough. Accuracy is modestly above the "always guess fish"
+> baseline; the coefficient-level story (RRRs above) is more informative
+> than this single number.
+
+## 1.7 Diagnostic: multicollinearity (VIF)
+
+`car::vif()` has no method for `"multinom"` objects, but VIF is a
+property of the **predictor** matrix alone — it does not depend on the
+outcome. So we can get a valid VIF by regressing any placeholder
+response on the same predictors with `lm()`, purely to reuse `vif()`'s
+machinery.
+
+```{r multinom-vif}
+vif_check <- lm(as.numeric(food) ~ lake + size + sex, data = gators)
+vif(vif_check)
+```
+
+> **Interpretation.** These are generalized VIFs (`GVIF^(1/(2*Df))`)
+> because `lake` has more than one degree of freedom; compare them to
+> the same square-root scale you'd use for an ordinary VIF of 5–10. All
+> three predictors are close to 1, so multicollinearity is not a
+> concern.
+
+## 1.8 Diagnostic: Independence of Irrelevant Alternatives (IIA)
+
+The formal test is `mlogit::hmftest()` (Hausman–McFadden), which needs
+the data reshaped into long format via `mlogit.data()`. For a quick,
+dependency-free check in this session, we instead refit the model after
+**dropping one alternative** — the rarest category, `bird` — and compare
+the surviving coefficients: if IIA holds, dropping an irrelevant
+alternative should barely move the remaining coefficients.
+
+```{r multinom-iia}
+gators_no_bird <- droplevels(gators[gators$food != "bird", ])
+model_mn_restricted <- multinom(food ~ lake + size + sex,
+                                 data = gators_no_bird, trace = FALSE)
+
+full_invert_coef       <- coef(model_mn)["invert", ]
+restricted_invert_coef <- coef(model_mn_restricted)["invert", ]
+
+round(rbind(full_model     = full_invert_coef,
+            bird_dropped   = restricted_invert_coef,
+            abs_difference = abs(full_invert_coef - restricted_invert_coef)), 4)
+```
+
+> **Interpretation.** Large shifts after dropping an alternative suggest
+> an IIA violation (classic example: the "red bus / blue bus" paradox).
+> Here the invertebrate-vs-fish coefficients barely move when `bird` is
+> removed — consistent with IIA holding. For a formal test, run
+> `install.packages("mlogit")` and use `mlogit::hmftest()`.
+
+# Part 2 — Ordinal Logistic Regression
+
+**Dataset: `Arthritis`** — a real double-blind clinical trial of a new
+treatment for rheumatoid arthritis (Koch & Edwards, 1988), distributed
+with the `vcd` package. The outcome, `Improved`, is genuinely
+**ordinal**: `None` \< `Some` \< `Marked`.
+
+## 2.1 Load and inspect the data
+
+```{r load-arthritis}
+data(Arthritis, package = "vcd")
+
+str(Arthritis)
+table(Arthritis$Improved)
+table(Arthritis$Treatment, Arthritis$Improved)
+```
+
+## 2.2 Fit the proportional-odds (ordinal logistic) model
+
+```{r fit-polr}
+model_or <- polr(Improved ~ Treatment + Sex + Age, data = Arthritis, Hess = TRUE)
+summary(model_or)
+```
+
+## 2.3 Statistical significance
+
+`polr()` also omits p-values by default — add them using the t-values it
+does report, compared against a standard normal.
+
+```{r polr-pvalues}
+or_coefs <- coef(summary(model_or))
+or_pvals <- pnorm(abs(or_coefs[, "t value"]), lower.tail = FALSE) * 2
+or_coefs <- cbind(or_coefs, "p value" = or_pvals)
+
+round(or_coefs, 4)
+```
+
+## 2.4 Odds ratios and confidence intervals
+
+```{r polr-or}
+or_ratios <- exp(coef(model_or))
+or_ci     <- exp(confint(model_or))
+
+round(or_ratios, 3)
+round(or_ci, 3)
+```
+
+> **Interpretation.** Because of the proportional-odds assumption, each
+> odds ratio applies at *every* cutpoint (None vs. Some+, and None/Some
+> vs. Marked) equally. Patients on the active **Treatment** have about
+> 5.7 times the odds of a better outcome than patients on **Placebo**
+> (95% CI roughly 2.3–15.1). **Male** patients have markedly lower odds
+> of improvement than female patients (OR ≈ 0.29), and each additional
+> year of **Age** is associated with about 4% higher odds of a better
+> outcome, holding treatment and sex fixed.
+
+## 2.5 Diagnostic: testing the proportional-odds assumption
+
+**(a) Formal test — the Brant test**, via the `brant` package:
+
+```{r brant-test}
+if (requireNamespace("brant", quietly = TRUE)) {
+  library(brant)
+  brant(model_or)
+} else {
+  message("Package 'brant' not installed — run install.packages(\"brant\") ",
+          "then library(brant); brant(model_or) to see the formal test.")
+}
+```
+
+The warning appears because `brant()` checks that every combination of
+the outcome (`Improved`) and categorical predictors (`Treatment`, `Sex`)
+has at least one observation, and in this 84-patient dataset one cell is
+empty — no male patients on Placebo showed "Some" improvement, which is
+just small-sample sparsity given only 17 patients in that subgroup, not
+an error. This makes the chi-square approximation for that comparison
+somewhat less reliable, but since only 1 of 12 cells is affected, the
+test still runs and gives sensible results.
+
+**(b) Manual, dependency-free check** — fit separate binary logits at
+each cutpoint and compare slopes. If proportional odds holds, the slope
+for each predictor should be similar across both binary models.
+
+```{r manual-po-check}
+Arthritis$y_ge_some   <- as.numeric(Arthritis$Improved %in% c("Some", "Marked"))
+Arthritis$y_ge_marked <- as.numeric(Arthritis$Improved == "Marked")
+
+fit_cut1 <- glm(y_ge_some ~ Treatment + Sex + Age, data = Arthritis, family = binomial)
+fit_cut2 <- glm(y_ge_marked ~ Treatment + Sex + Age, data = Arthritis, family = binomial)
+
+round(cbind("P(Y>=Some)" = coef(fit_cut1),
+            "P(Y>=Marked)" = coef(fit_cut2)), 4)
+```
+
+> **Interpretation.** `Treatment`'s slope is nearly identical across
+> both cutpoints (1.76 vs. 1.77) — strong support for proportional odds
+> on that predictor. `Age` is fairly stable too. `Sex` shows more
+> movement (-1.49 vs. -0.90), which is plausible sampling noise at this
+> sample size (n = 84) but is exactly the kind of predictor you'd watch
+> closely in a formal Brant test before trusting a single pooled odds
+> ratio for it.
+
+## 2.6 Overall model fit
+
+```{r polr-fit}
+model_or_null <- polr(Improved ~ 1, data = Arthritis, Hess = TRUE)
+
+lr_stat_or  <- as.numeric(2 * (logLik(model_or) - logLik(model_or_null)))
+lr_df_or    <- attr(logLik(model_or), "df") - attr(logLik(model_or_null), "df")
+lr_p_or     <- pchisq(lr_stat_or, df = lr_df_or, lower.tail = FALSE)
+mcfadden_or <- as.numeric(1 - logLik(model_or) / logLik(model_or_null))
+
+cat(sprintf("Likelihood ratio chi-sq(%d) = %.2f, p = %.3g\n", lr_df_or, lr_stat_or, lr_p_or))
+cat(sprintf("McFadden's pseudo-R^2 = %.3f\n", mcfadden_or))
+cat(sprintf("AIC = %.1f   BIC = %.1f\n", AIC(model_or), BIC(model_or)))
+```
+
+## 2.7 Classification accuracy
+
+```{r polr-accuracy}
+pred_or <- predict(model_or, type = "class")
+tab_or  <- table(Predicted = pred_or, Actual = Arthritis$Improved)
+tab_or
+
+sprintf("Accuracy = %.3f", sum(diag(tab_or)) / sum(tab_or))
+```
+
+## 2.8 Diagnostic: multicollinearity (VIF)
+
+Unlike `multinom`, `car::vif()` **does** support `"polr"` objects
+directly.
+
+```{r polr-vif}
+vif(model_or)
+```
+
+> **Interpretation.** All VIFs are close to 1 — treatment, sex, and age
+> were well balanced by the trial's design, so multicollinearity is not
+> a concern here.
+
+# Part 3 — Recap: Choosing Between the Two Models
+
+```{r recap}
+cat(
+  "Multinomial (food ~ ...):        AIC =", round(AIC(model_mn), 1),
+  " | McFadden R^2 =", round(mcfadden_mn, 3),
+  " | key assumption: IIA\n",
+  "Ordinal (Improved ~ ...):        AIC =", round(AIC(model_or), 1),
+  " | McFadden R^2 =", round(mcfadden_or, 3),
+  " | key assumption: proportional odds\n",
+  sep = "")
+```
+
+> **Decision rule.** Is the outcome ordered?
+>
+> - **No** → multinomial logit (`nnet::multinom`), interpret via RRRs.
+> - **Yes** → ordinal logit (`MASS::polr`); run `brant()` to confirm
+>   proportional odds before trusting a single odds ratio per predictor.
+
+------------------------------------------------------------------------
+
+*End of Session 7 hands-on notebook.*
+
+**Data sources**
+
+- Agresti, A. (2002). *Categorical Data Analysis* (2nd ed.), Table 7.1 —
+  alligator food-choice study (via the `vcdExtra` package).
+- Koch, G. & Edwards, S. (1988). Clinical efficiency trials with
+  categorical data. In K. E. Peace (ed.), *Biopharmaceutical Statistics
+  for Drug Development*, 403–451 (via the `vcd` package).
+- Deb, P. & Trivedi, P.K. (1997). Demand for Medical Care by the
+  Elderly: A Finite Mixture Approach. *Journal of Applied Econometrics*,
+  12, 313–336 (via the `AER` package).
