@@ -1,0 +1,468 @@
+---
+title: 'Hands-on: Logistic Regression - Modeling a binary outcome'
+subtitle: " LR as a classifier/Predicting Diabetes with a Train/Test Split"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+date: "`r Sys.Date()`"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview {.unnumbered}
+
+In this lab we fit a logistic regression and interpret its coefficients.
+We will also treat the same kind of model as a **classifier**: we build
+it on a **training set**, then judge it on a **test set** it has never
+seen. This is the honest way to estimate how a model will perform on new
+cases.
+
+**Learning objectives.** By the end of this lab you should be able to:
+
+- Split data into training and test sets reproducibly with `set.seed()`
+- Fit a logistic regression on the training set only, interpret the
+  results.
+- Generate predicted probabilities and class labels for held-out data
+- Build a confusion matrix and compute accuracy, sensitivity,
+  specificity, and precision
+- Run logistic-regression diagnostics: multicollinearity, linearity of
+  the logit, influential points, and calibration
+- Draw an ROC curve and compute AUC on the test set
+- Explain why the decision **threshold** is a choice, not a fixed
+  constant
+
+------------------------------------------------------------------------
+
+# Setup & the Data
+
+We'll use the **Pima Indians Diabetes** data from **MASS**. It records
+diagnostic measurements for women of Pima heritage, with the goal of
+predicting whether each person tested positive for diabetes.
+
+```{r packages}
+# install.packages(c("MASS", "tidyverse", "pROC", "car", "broom"))
+library(MASS)       # for the Pima diabetes data
+library(tidyverse)  # dplyr, ggplot2
+library(pROC)       # ROC / AUC
+library(car)        # vif() for multicollinearity
+library(broom)      # augment() for diagnostics
+```
+
+MASS actually ships this data already split into `Pima.tr` (training)
+and `Pima.te` (test). For this lab we combine them back into one frame
+and then make our **own** split, so you can see exactly how splitting
+works. In a real project you would do this once, up front.
+
+```{r load-data}
+data(Pima.tr)
+data(Pima.te)
+
+pima <- bind_rows(Pima.tr, Pima.te)
+glimpse(pima)
+```
+
+**Variable key**
+
+| Column  | Meaning                                               |
+|---------|-------------------------------------------------------|
+| `npreg` | number of pregnancies                                 |
+| `glu`   | plasma glucose concentration (oral glucose tolerance) |
+| `bp`    | diastolic blood pressure (mm Hg)                      |
+| `skin`  | triceps skin-fold thickness (mm)                      |
+| `bmi`   | body mass index (kg/m\^2)                             |
+| `ped`   | diabetes pedigree function (family-history score)     |
+| `age`   | age (years)                                           |
+| `type`  | **outcome**: `Yes` = diabetic, `No` = not diabetic    |
+
+```{r outcome-setup}
+# Make sure the outcome is a factor with "No" as the reference (first) level,
+# so the model predicts the probability of "Yes" (diabetes).
+pima <- pima %>% mutate(type = factor(type, levels = c("No", "Yes")))
+
+summary(pima)
+```
+
+------------------------------------------------------------------------
+
+# Exploratory Data Analysis
+
+### Outcome balance
+
+Class balance matters: if 90% of patients were "No", a model could score
+90% accuracy by ignoring the data and guessing "No" every time. Always
+check this before trusting accuracy.
+
+```{r eda-balance}
+pima %>%
+  count(type) %>%
+  mutate(prop = round(n / sum(n), 3))
+```
+
+### Predictors vs. the outcome
+
+```{r eda-continuous}
+pima %>%
+  pivot_longer(c(glu, bmi, age, ped, npreg, bp, skin),
+               names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = type, y = value, fill = type)) +
+  geom_boxplot(alpha = 0.6) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(title = "Predictor distributions by diabetes status",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r eda-glucose}
+ggplot(pima, aes(x = glu, fill = type)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Plasma glucose by diabetes status",
+       x = "Plasma glucose", y = "Density") +
+  theme_minimal()
+```
+
+> **Your turn (2 min):** Which predictors separate the two groups most
+> clearly? Glucose and BMI are usually strong here - note your guesses
+> and compare them to the fitted coefficients later.
+
+------------------------------------------------------------------------
+
+# Train/Test Split
+
+We hold out a random **30%** of the data as a test set and train on the
+other **70%**. Two important habits:
+
+- **`set.seed()`** makes the random split reproducible - you (and we)
+  get the same split every time the document is knit.
+- We split in a **stratified** way (separately within each outcome
+  class) so the training and test sets have roughly the same proportion
+  of diabetics.
+
+```{r split}
+set.seed(2024)
+
+# Stratified 70/30 split: sample row indices within each class.
+train_idx <- pima %>%
+  mutate(row = row_number()) %>%
+  group_by(type) %>%
+  slice_sample(prop = 0.70) %>%
+  pull(row)
+
+train <- pima[train_idx, ]
+test  <- pima[-train_idx, ]
+
+# Check the sizes and that class balance is preserved in both sets.
+list(
+  n_train = nrow(train),
+  n_test  = nrow(test),
+  train_balance = round(prop.table(table(train$type)), 3),
+  test_balance  = round(prop.table(table(test$type)), 3)
+)
+```
+
+> **Golden rule:** from here on, the test set is off-limits until the
+> very end. All exploring, fitting, and model evaluation happens on
+> `train`. Peeking at the test set to make modeling decisions ("data
+> leakage") gives you an over-optimistic performance estimate.
+
+------------------------------------------------------------------------
+
+# Train the Model (on training data only)
+
+### Fit the full model
+
+```{r fit-full}
+full_model <- glm(
+  type ~ npreg + glu + bp + skin + bmi + ped + age,
+  data = train,
+  family = binomial(link = "logit")
+)
+summary(full_model)
+```
+
+### Simplify with stepwise selection
+
+Model selection is part of "building the model", so it must use the
+training data only. We let `step()` drop predictors that don't earn
+their place by AIC.
+
+```{r step}
+final_model <- step(full_model, direction = "both", trace = 0)
+summary(final_model)
+```
+
+### Odds ratios for interpretation
+
+```{r odds-ratios}
+exp(cbind(OR = coef(final_model), confint(final_model)))
+```
+
+Recall the reading: an odds ratio above 1 means higher odds of diabetes
+as that predictor increases; below 1 means lower odds. For example, an
+OR of about 1.04 for `glu` means each additional unit of plasma glucose
+multiplies the odds of diabetes by \~1.04, or increases the odds of
+diabetes by 4%, holding the other predictors fixed. If the family
+pedigree score increases wih 1 unit, the odds for diabetes will increase
+with 2.7 times.
+
+------------------------------------------------------------------------
+
+# Model Diagnostics
+
+A model can have a decent AUC and still violate its assumptions or lean
+on a few odd patients. These checks all run on the **training** model -
+they are part of building and trusting the model, so they stay on the
+training side of the wall.
+
+### Multicollinearity (VIF)
+
+If two predictors carry nearly the same information, their coefficients
+become unstable. Variance inflation factors (VIF) flag this. A common
+rule of thumb: VIF above 5 is worth a look, above 10 is a real problem.
+
+```{r vif}
+vif(final_model)
+```
+
+### Linearity of the logit
+
+Logistic regression assumes each **continuous** predictor is linearly
+related to the log-odds of the outcome - not to the probability, but to
+the logit. We check by plotting each predictor against the model's
+linear predictor (the log-odds) with a smoother. Roughly straight lines
+support the assumption; strong curves suggest a transformation (e.g. a
+log or a quadratic term) might help.
+
+```{r linearity, fig.width=8, fig.height=5}
+train %>%
+  mutate(logit = predict(final_model, type = "link")) %>%
+  pivot_longer(c(npreg, glu, bmi, ped, age),
+               names_to = "predictor", values_to = "value") %>%
+  ggplot(aes(value, logit)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, colour = "#2c7fb8") +
+  facet_wrap(~ predictor, scales = "free_x") +
+  labs(title = "Linearity of the logit",
+       x = NULL, y = "Log-odds (linear predictor)") +
+  theme_minimal(base_size = 12)
+```
+
+> **Your turn (2 min):** Which predictors look acceptably straight? If
+> one curves noticeably, what transformation might you try?
+
+### Influential observations
+
+A single unusual patient shouldn't drive the whole model. **Cook's
+distance** measures how much the fitted coefficients would move if an
+observation were dropped. A common flag is `4 / n`; points above the
+dashed line deserve a closer look (they are candidates for inspection,
+not automatic deletion).
+
+```{r influence, fig.width=8, fig.height=4}
+diag_df <- augment(final_model) %>% mutate(obs = row_number())
+cook_thresh <- 4 / nrow(train)
+
+ggplot(diag_df, aes(obs, .cooksd)) +
+  geom_segment(aes(xend = obs, yend = 0), colour = "grey70") +
+  geom_hline(yintercept = cook_thresh, linetype = "dashed", colour = "red") +
+  labs(title = "Cook's distance", x = "Observation index", y = "Cook's distance") +
+  theme_minimal(base_size = 12)
+
+# How many observations exceed the 4/n rule of thumb?
+sum(diag_df$.cooksd > cook_thresh)
+```
+
+------------------------------------------------------------------------
+
+# Evaluate on the Test Set
+
+Now - and only now - we bring in the held-out test set. We generate
+predicted **probabilities** for each test patient, then turn them into
+**class labels** using a threshold of 0.5.
+
+```{r predict}
+# Predicted probability of "Yes" (diabetes) for each test-set patient.
+test_prob <- predict(final_model, newdata = test, type = "response")
+
+# Convert probabilities to class labels. IMPORTANT: give the prediction the
+# SAME factor levels as the true outcome, so the confusion-matrix rows and
+# columns line up correctly.
+test_pred <- factor(
+  if_else(test_prob > 0.5, "Yes", "No"),
+  levels = levels(test$type)
+)
+```
+
+### Confusion matrix
+
+```{r confusion}
+conf_mat <- table(Predicted = test_pred, Actual = test$type)
+conf_mat
+```
+
+### Performance metrics
+
+Reading the confusion matrix (with "Yes" = diabetes as the positive
+class):
+
+- **TP** true positives, **TN** true negatives
+- **FP** false positives (predicted diabetes, actually not)
+- **FN** false negatives (missed a real diabetes case)
+
+```{r metrics}
+TP <- conf_mat["Yes", "Yes"]
+TN <- conf_mat["No",  "No"]
+FP <- conf_mat["Yes", "No"]
+FN <- conf_mat["No",  "Yes"]
+
+metrics <- tibble(
+  accuracy    = (TP + TN) / sum(conf_mat),          # overall correct
+  sensitivity = TP / (TP + FN),                     # recall: caught diabetics
+  specificity = TN / (TN + FP),                     # correctly cleared non-diabetics
+  precision   = TP / (TP + FP)                      # of predicted "Yes", how many were right
+)
+round(metrics, 3)
+```
+
+> **Your turn (3 min):** In a screening setting, which is worse - a
+> false positive (telling a healthy person they may have diabetes) or a
+> false negative (missing a real case)? How does that shape which metric
+> you care about most?
+
+### ROC curve and AUC
+
+The confusion matrix above depends on the 0.5 cutoff. The ROC curve
+instead sweeps *every* possible cutoff and plots sensitivity against 1 -
+specificity. AUC (area under the curve) summarizes performance across
+all thresholds: 0.5 is a coin flip, 1.0 is perfect.
+
+We pull the curve's coordinates out of the `roc` object and draw it in
+`ggplot2` so both axes run cleanly from 0 to 1. The dashed diagonal is
+the "random guessing" line - a good model bows toward the top-left
+corner.
+
+```{r roc, fig.width=6, fig.height=6}
+roc_obj <- roc(test$type, test_prob, levels = c("No", "Yes"))
+
+roc_df <- tibble(
+  fpr = 1 - roc_obj$specificities,   # false positive rate
+  tpr = roc_obj$sensitivities        # true positive rate
+) %>% arrange(fpr)
+
+auc_val <- as.numeric(auc(roc_obj))
+
+ggplot(roc_df, aes(fpr, tpr)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "grey60") +
+  geom_path(colour = "#2c7fb8", linewidth = 1.2) +
+  annotate("text", x = 0.62, y = 0.10, hjust = 0, size = 4,
+           label = paste0("AUC = ", sprintf("%.3f", auc_val))) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  labs(title = "ROC curve (test set)",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity (True Positive Rate)") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+```
+
+## Documentation
+
+### Methods
+
+We analysed the Pima Indians Diabetes data (n = 532 women), in which the
+outcome was a binary diagnosis of diabetes (177 positive, 33.3%; 355
+negative). The data were partitioned into a training set (70%, n = 371)
+and a held-out test set (30%, n = 161) using a stratified random split
+with a fixed seed, which preserved the outcome prevalence in both
+partitions (training 33.2%, test 33.5%). A logistic regression model
+with a logit link was fit on the training set using seven candidate
+predictors (number of pregnancies, plasma glucose, diastolic blood
+pressure, triceps skin-fold thickness, body mass index, diabetes
+pedigree function, and age). The model was simplified by bidirectional
+stepwise selection minimising the Akaike Information Criterion (AIC);
+all model building was confined to the training set. Model assumptions
+were assessed on the training data (multicollinearity via variance
+inflation factors, linearity of the logit for continuous predictors, and
+influential observations via Cook's distance). Discrimination was
+evaluated on the test set using the area under the ROC curve (AUC). A
+classification threshold of 0.5 was used for the primary confusion
+matrix, with a sensitivity analysis at 0.3.
+
+### Results
+
+Stepwise selection retained five predictors—plasma glucose, body mass
+index, diabetes pedigree function, age, and number of
+pregnancies—dropping blood pressure and skin-fold thickness; the reduced
+model marginally improved on the full model by AIC (328.1 vs 330.2) and
+explained a moderate share of outcome variation (McFadden pseudo-R² =
+0.33). Higher plasma glucose (odds ratio [OR] 1.04 per unit, 95% CI
+1.03–1.05, p \< 0.001), higher BMI (OR 1.09 per unit, 95% CI 1.04–1.13,
+p \< 0.001), a higher diabetes pedigree score (OR 2.80, 95% CI
+1.17–6.91, p = 0.023), and older age (OR 1.04 per year, 95% CI
+1.01–1.08, p = 0.011) were each independently associated with greater
+odds of diabetes, whereas number of pregnancies was not statistically
+significant (OR 1.09, 95% CI 0.98–1.21, p = 0.10). Multicollinearity was
+negligible (all variance inflation factors \< 1.7), and the continuous
+predictors were approximately linear on the logit scale. On the held-out
+test set the model discriminated well, with an AUC of 0.83 (95% CI
+0.77–0.89). At the default 0.5 threshold, overall accuracy was 75.2%,
+with specificity of 0.86 and precision of 0.66 but modest sensitivity of
+0.54, indicating the model missed nearly half of true diabetes cases at
+this cut-off.
+
+------------------------------------------------------------------------
+
+# Thresholds & Wrap-Up
+
+The 0.5 cutoff is a default, not a law. Lowering it flags more patients
+as positive - catching more true cases (higher sensitivity) at the cost
+of more false alarms (lower specificity). Here's the same test set
+scored at a lower threshold of 0.3:
+
+```{r threshold}
+test_pred_30 <- factor(
+  if_else(test_prob > 0.6, "Yes", "No"),
+  levels = levels(test$type)
+)
+cm30 <- table(Predicted = test_pred_30, Actual = test$type)
+cm30
+
+tibble(
+  threshold   = 0.60,
+  sensitivity = cm30["Yes", "Yes"] / sum(cm30[, "Yes"]),
+  specificity = cm30["No",  "No"]  / sum(cm30[, "No"])
+) %>% round(3)
+```
+
+Compare these numbers to the 0.5 results above and notice the trade-off.
+
+## Wrap-up exercises
+
+Try these on your own:
+
+1.  Re-run the whole notebook with a different seed (say `set.seed(1)`).
+    Do the test-set accuracy and AUC change a lot? What does that tell
+    you about trusting a single split?
+2.  Sweep thresholds from 0.1 to 0.9 and plot sensitivity and
+    specificity against the threshold. Where do the two curves cross?
+3.  Fit a model using **only** `glu` and `bmi`. How much test-set AUC do
+    you lose compared to the full model? Is the simpler model "good
+    enough"?
+4.  Split the data 50/50 instead of 70/30. Does the smaller training set
+    hurt test performance? Why might it?
+5.  In one short paragraph, report your final model's test-set
+    performance the way you would to a clinician: accuracy, how many
+    real cases it catches, and how often it raises a false alarm.
+
+```{r session-info}
+sessionInfo()
+```
